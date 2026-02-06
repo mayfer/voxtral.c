@@ -9,7 +9,7 @@
 
 ## Current Baseline (2026-02-06)
 - Decoder: 23.7 ms/token (was 43.2 at start)
-- Encoder: ~800ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
+- Encoder: ~456ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
 - Theoretical decoder floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
 - Remaining decoder overhead: 1 command buffer per token
 
@@ -89,11 +89,19 @@
 - Was the only remaining CPU matmul in the encoder pipeline
 - **Result: encoder 804 → 683 ms (test_speech), 1295 → 1254 ms (jfk)**
 
+### Attempt 8: Fused encoder attention kernel (SUCCESS)
+- Replaced per-head MPS matmul encodes (QK^T + softmax + scores×V) with single compute kernel
+- New Metal shader: encoder_attention (online softmax, SIMD cooperative dot products)
+- 64 per-head encodes per layer → 1 compute dispatch per layer
+- 2048 total MPS encodes → 32 compute dispatches (32 layers × 1)
+- **Result: encoder 605 → 456 ms (test_speech), 1242 → 1082 ms (jfk)**
+- **Cumulative encoder: 2.7s → 456 ms (83% faster)**
+
 ### Next targets
 - Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
-- Encoder: ~683ms for test_speech, dominated by GPU transformer layers
-  - Attention: 64 per-head MPS encodes per layer × 32 = 2048 encodes (high overhead)
-  - Ideas: fused/batched encoder attention, merged encoder QKV weights
+- Encoder: ~456ms for test_speech
+  - Still 32 command buffer round-trips (1 per layer for attention)
+  - Ideas: merged encoder QKV weights, fused encoder layers
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX

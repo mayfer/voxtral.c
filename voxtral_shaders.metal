@@ -353,3 +353,91 @@ kernel void decoder_attention(
         out_h[tid] = acc / (running_sum + 1e-10f);
     }
 }
+
+/* ========================================================================
+ * Batched encoder attention: one threadgroup per (head, query_position).
+ * Replaces 64 per-head MPS matmul encodes with a single compute dispatch.
+ * Q/K/V layout: [seq, n_heads * head_dim] packed (head-interleaved).
+ * Uses online softmax, 64 threads per group (head_dim=64, 2 SIMD groups).
+ * ======================================================================== */
+
+kernel void encoder_attention(
+    device const float *Q [[buffer(0)]],
+    device const float *K [[buffer(1)]],
+    device const float *V [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &n_heads [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim [[buffer(6)]],
+    constant int &seq_q [[buffer(7)]],
+    constant int &seq_k [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &window_size [[buffer(10)]],
+    constant int &q_offset [[buffer(11)]],
+    uint group_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    /* 1D grid: group_idx = h * seq_q + qi */
+    int h = (int)group_idx / seq_q;
+    int qi = (int)group_idx % seq_q;
+    if (h >= n_heads || qi >= seq_q) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_h = h / gqa_ratio;
+    int stride_q = n_heads * head_dim;
+    int stride_kv = n_kv_heads * head_dim;
+
+    device const float *q_row = Q + (long)qi * stride_q + h * head_dim;
+    device float *out_row = out + (long)qi * stride_q + h * head_dim;
+
+    int q_pos = q_offset + qi;
+    int valid_end = min(q_pos, seq_k - 1);
+    int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+
+    /* 64 threads = 2 SIMD groups of 32 */
+    threadgroup float shared_simd[2];
+
+    float q_val = (int)tid < head_dim ? q_row[tid] : 0.0f;
+
+    /* Online softmax: single pass over keys */
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc = 0.0f;
+
+    for (int j = valid_start; j <= valid_end; j++) {
+        device const float *k_j = K + (long)j * stride_kv + kv_h * head_dim;
+
+        /* Cooperative dot product using SIMD reductions */
+        float partial = (int)tid < head_dim ? q_val * k_j[tid] : 0.0f;
+        float simd_partial = simd_sum(partial);
+
+        /* Cross-SIMD reduction: 2 groups → 1 value */
+        if (simd_lid == 0) shared_simd[simd_gid] = simd_partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            shared_simd[0] = (shared_simd[0] + shared_simd[1]) * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float score = shared_simd[0];
+
+        /* Online softmax update */
+        float old_max = running_max;
+        running_max = fmax(running_max, score);
+        float correction = exp(old_max - running_max);
+        running_sum = running_sum * correction + exp(score - running_max);
+        acc = acc * correction;
+
+        /* Accumulate weighted V */
+        if ((int)tid < head_dim) {
+            device const float *v_j = V + (long)j * stride_kv + kv_h * head_dim;
+            acc += exp(score - running_max) * v_j[tid];
+        }
+    }
+
+    /* Normalize and write output */
+    if ((int)tid < head_dim) {
+        out_row[tid] = acc / (running_sum + 1e-10f);
+    }
+}

@@ -129,6 +129,18 @@ void vox_metal_batched_attention(float *out,
                                   int window_size, int q_offset);
 
 /*
+ * Fused encoder attention: single compute dispatch for all heads.
+ * Replaces per-head MPS matmul encodes with a single kernel.
+ * Same interface as vox_metal_batched_attention.
+ */
+void vox_metal_encoder_attention(float *out,
+                                   const float *Q, const float *K, const float *V,
+                                   int seq_q, int seq_k,
+                                   int n_heads, int n_kv_heads,
+                                   int head_dim, float scale,
+                                   int window_size, int q_offset);
+
+/*
  * Fused final RMSNorm + logits matmul + argmax.
  * Computes: x_norm = rms_norm(x, norm, eps), logits = x_norm @ tok_emb^T, argmax.
  * Returns best token ID. logits_out may be NULL if not needed.

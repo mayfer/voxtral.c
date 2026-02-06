@@ -238,7 +238,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
         float scale = 1.0f / sqrtf((float)head_dim);
 #ifdef USE_METAL
         if (vox_metal_available()) {
-            vox_metal_batched_attention(attn_out, q, k, v,
+            vox_metal_encoder_attention(attn_out, q, k, v,
                                          seq_len, seq_len, n_heads, VOX_ENC_KV_HEADS,
                                          head_dim, scale, VOX_ENC_WINDOW, 0);
         } else {
@@ -525,7 +525,7 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
 
 #ifdef USE_METAL
         if (vox_metal_available()) {
-            vox_metal_batched_attention(attn_out, q, full_k, full_v,
+            vox_metal_encoder_attention(attn_out, q, full_k, full_v,
                                          new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
                                          head_dim, scale, VOX_ENC_WINDOW, cache_len);
         } else {

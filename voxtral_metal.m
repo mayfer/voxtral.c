@@ -44,6 +44,7 @@ static id<MTLBuffer> g_dec_x = nil;
 static id<MTLComputePipelineState> g_rope_apply_pipeline = nil;
 static id<MTLComputePipelineState> g_kv_cache_copy_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_attention_pipeline = nil;
+static id<MTLComputePipelineState> g_encoder_attention_pipeline = nil;
 
 /* GPU-shared memory tracking (zero-copy between CPU and GPU) */
 #define SHARED_ALLOC_MAX 8
@@ -462,6 +463,9 @@ static int init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"decoder_attention"];
         if (func) g_decoder_attention_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
 
+        func = [g_shader_library newFunctionWithName:@"encoder_attention"];
+        if (func) g_encoder_attention_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
         g_shaders_initialized = 1;
 
         if (vox_verbose >= 2) {
@@ -540,6 +544,7 @@ void vox_metal_shutdown(void) {
         g_rope_apply_pipeline = nil;
         g_kv_cache_copy_pipeline = nil;
         g_decoder_attention_pipeline = nil;
+        g_encoder_attention_pipeline = nil;
 
         /* Release shared allocs */
         for (int i = 0; i < g_shared_count; i++)
@@ -2182,6 +2187,75 @@ void vox_metal_batched_attention(float *out,
         pool_release_buffer(bufK);
         pool_release_buffer(bufV);
         pool_release_buffer(bufScores);
+        pool_release_buffer(bufOut);
+    }
+}
+
+/* ========================================================================
+ * Fused Encoder Attention (single compute dispatch, all heads)
+ * Replaces 64 per-head MPS matmul encodes with 1 compute kernel.
+ * ======================================================================== */
+
+void vox_metal_encoder_attention(float *out,
+                                   const float *Q, const float *K, const float *V,
+                                   int seq_q, int seq_k,
+                                   int n_heads, int n_kv_heads,
+                                   int head_dim, float scale,
+                                   int window_size, int q_offset) {
+    if (!g_initialized || !g_encoder_attention_pipeline) return;
+
+    @autoreleasepool {
+        size_t q_total = (size_t)seq_q * n_heads * head_dim;
+        size_t k_total = (size_t)seq_k * n_kv_heads * head_dim;
+        size_t out_total = q_total;
+
+        id<MTLBuffer> bufQ = pool_get_buffer(q_total * sizeof(float));
+        id<MTLBuffer> bufK = pool_get_buffer(k_total * sizeof(float));
+        id<MTLBuffer> bufV = pool_get_buffer(k_total * sizeof(float));
+        id<MTLBuffer> bufOut = pool_get_buffer(out_total * sizeof(float));
+
+        if (!bufQ || !bufK || !bufV || !bufOut) {
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+            pool_release_buffer(bufV);
+            pool_release_buffer(bufOut);
+            return;
+        }
+
+        memcpy([bufQ contents], Q, q_total * sizeof(float));
+        memcpy([bufK contents], K, k_total * sizeof(float));
+        memcpy([bufV contents], V, k_total * sizeof(float));
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_encoder_attention_pipeline];
+        [enc setBuffer:bufQ offset:0 atIndex:0];
+        [enc setBuffer:bufK offset:0 atIndex:1];
+        [enc setBuffer:bufV offset:0 atIndex:2];
+        [enc setBuffer:bufOut offset:0 atIndex:3];
+        [enc setBytes:&n_heads length:sizeof(int) atIndex:4];
+        [enc setBytes:&n_kv_heads length:sizeof(int) atIndex:5];
+        [enc setBytes:&head_dim length:sizeof(int) atIndex:6];
+        [enc setBytes:&seq_q length:sizeof(int) atIndex:7];
+        [enc setBytes:&seq_k length:sizeof(int) atIndex:8];
+        [enc setBytes:&scale length:sizeof(float) atIndex:9];
+        [enc setBytes:&window_size length:sizeof(int) atIndex:10];
+        [enc setBytes:&q_offset length:sizeof(int) atIndex:11];
+
+        /* 1D grid: n_heads * seq_q threadgroups, 64 threads each (head_dim=64) */
+        NSUInteger total_groups = (NSUInteger)n_heads * (NSUInteger)seq_q;
+        [enc dispatchThreadgroups:MTLSizeMake(total_groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        memcpy(out, [bufOut contents], out_total * sizeof(float));
+
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
         pool_release_buffer(bufOut);
     }
 }
