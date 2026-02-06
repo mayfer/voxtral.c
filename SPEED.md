@@ -7,6 +7,13 @@
 - Re-read this file at each context compaction
 - Take notes on all results, what worked, what didn't
 
+## Testing
+- **Quick iteration**: use short samples in `samples/` (test_speech.wav, jfk.wav)
+  for timing measurements during development
+- **Before committing**: run `./runtest.sh` to verify no regressions (batch +
+  streaming with KV cache compaction). This is slow (~2 min), so only run it as
+  the final check before each commit
+
 ## Current Baseline (2026-02-06)
 - Decoder: 23.7 ms/token (was 43.2 at start)
 - Prefill: ~335ms (was ~1200ms)
