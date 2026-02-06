@@ -8,10 +8,10 @@
 - Take notes on all results, what worked, what didn't
 
 ## Current Baseline (2026-02-06)
-- Decoder: 43.2 ms/token
-- Encoder: ~2.4s (test_speech.wav, 3.6s audio)
-- Theoretical floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
-- Remaining overhead: ~79 command buffer round-trips per token
+- Decoder: 23.7 ms/token (was 43.2 at start)
+- Encoder: ~800ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
+- Theoretical decoder floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
+- Remaining decoder overhead: 1 command buffer per token
 
 ## Already Optimized
 - Fused QKV: 3 matmuls → 1 command buffer (saves 52 round-trips/token)
@@ -76,10 +76,19 @@
 - **Result: 25.3 → 23.7 ms/step (test_speech), ~24.9 ms/step (jfk)**
 - **Cumulative from baseline: 43.2 → 23.7 ms/step (45% faster)**
 
+### Attempt 6: BLAS conv1d (im2col + sgemm) (SUCCESS — HUGE)
+- Replaced naive 4-nested-loop causal_conv1d with im2col + cblas_sgemm
+- Old: per-element scalar multiply-adds (~875M iterations for conv1, ~174M for conv0)
+- New: build im2col matrix, single BLAS sgemm per convolution
+- Conv0: sgemm(1280, 355, 384) ≈ <1ms. Conv1: sgemm(1280, 178, 3840) ≈ 3ms
+- **Result: encoder conv stem 2008ms → 12ms (167x faster!)**
+- **Encoder total: 2737 → 804 ms (test_speech), 5613 → 1295 ms (jfk)**
+
 ### Next targets
-- Theoretical floor: ~23 ms (300 GB/s, 6.9 GB weights)
-- Gap: 23.7 - 23 = 0.7ms (very close to memory bandwidth limit)
-- Ideas: encoder speedups, attention kernel optimizations for longer sequences
+- Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
+- Encoder: ~800ms for test_speech, dominated by GPU transformer layers
+  - GPU QKV/FFN: ~500ms, GPU attention: ~200ms, CPU wo: ~50ms
+  - Ideas: move wo projection to GPU, merged encoder QKV weights
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX
