@@ -15,9 +15,9 @@
   the final check before each commit
 
 ## Current Baseline (2026-02-06)
-- Decoder: 23.7 ms/token (was 43.2 at start)
+- Decoder: 23.5 ms/token (was 43.2 at start)
 - Prefill: ~252ms (was ~1200ms)
-- Encoder: ~298ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
+- Encoder: ~284ms (test_speech.wav, 3.6s audio), ~539ms (jfk.wav, 11s audio) (was ~2.7s at start)
 - Theoretical decoder floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
 - Remaining decoder overhead: 1 command buffer per token
 
@@ -152,14 +152,24 @@
 - No additional GPU memory (decoder merged weights already pre-warmed)
 - **Result: prefill ~335 → ~252 ms (25% faster)**
 
+### Attempt 14: Q-tiled encoder attention (SUCCESS — BIG for long audio)
+- Each threadgroup processes BQ=8 consecutive queries instead of 1
+- Loads K/V once per key position, computes 8 dot products (amortizes K/V reads ~8x)
+- Per-query causal/window masking within the BQ block (skip invalid positions)
+- BQ sets of online softmax state in registers (38 floats/thread, well within limits)
+- Shared memory: 4×BQ (SIMD reduction) + BQ (scores) = 40 floats
+- Attention cost: 0.133ms/KV_pos → 0.058ms/KV_pos (2.3x faster attention)
+- **Result: test_speech encoder 298 → 284ms (5% faster, short KV cache)**
+- **Result: jfk encoder 700 → 539ms (23% faster, attention-dominated)**
+- **Cumulative encoder: 2.7s → 284ms (test_speech, 89% faster), 539ms (jfk)**
+
 ### Next targets
-- Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
-- Encoder: ~298ms for test_speech
-  - MPS encoding overhead now only ~14ms (not the bottleneck)
-  - GPU compute dominates: matmul + attention scaling with KV cache length
-  - Attention is near memory bandwidth limit for large KV caches
+- Decoder: ~23.5 ms/step, theoretical floor ~23 ms (0.5ms gap, near bandwidth limit)
+- Encoder: ~284ms (test_speech), ~539ms (jfk)
+  - Matmul fixed cost: ~18ms per 100-position call (at 3.5 TFLOPS, ~25% of peak)
+  - Attention now 0.058ms/KV_pos (was 0.133ms), still has room for improvement
+  - First encoder call has ~50ms warmup overhead (MPS pipeline JIT)
 - Prefill: ~252ms (improved from ~335ms)
-  - MPS pipeline warmup on first command buffer still causes ~30ms extra on first run
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX
